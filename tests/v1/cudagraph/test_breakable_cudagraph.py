@@ -16,8 +16,6 @@ import torch
 def _enable_breakable_cudagraph(monkeypatch: pytest.MonkeyPatch):
     """Enable breakable cudagraphs for this module's tests only.
 
-    eager_break_during_capture reads the env at decoration time, which
-    happens inside the test bodies, so a per-test fixture suffices.
     monkeypatch restores the env so other test files running in the same
     pytest process are unaffected (a module-level os.environ assignment
     used to leak into test_cudagraph_dispatch.py and break it).
@@ -118,9 +116,11 @@ def cuda_capture_stream():
 # ---------------------------------------------------------------------------
 
 
-def test_decorator_passthrough_outside_capture():
+@pytest.mark.parametrize("enabled", [False, True])
+def test_decorator_passthrough_outside_capture(monkeypatch, enabled):
     from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", str(int(enabled)))
     calls = []
 
     @eager_break_during_capture
@@ -130,6 +130,86 @@ def test_decorator_passthrough_outside_capture():
 
     assert f(3) == 6
     assert calls == [3]
+
+
+@pytest.mark.parametrize("initial_flag", [None, "0", "1"])
+def test_decorator_handles_late_enable(monkeypatch, cuda_capture_stream, initial_flag):
+    """Configuration may enable graphs after model ops have been imported."""
+    from vllm.compilation.breakable_cudagraph import (
+        BreakableCUDAGraphCapture,
+        eager_break_during_capture,
+    )
+
+    monkeypatch.delenv("VLLM_USE_BREAKABLE_CUDAGRAPH", raising=False)
+    if initial_flag is not None:
+        monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", initial_flag)
+    metadata = {"bias": 1}
+
+    @eager_break_during_capture
+    def attention(query, output):
+        torch.add(query, metadata["bias"], out=output)
+
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "1")
+    x = torch.ones(8, device="cuda")
+    output = torch.empty_like(x)
+    attention(x, output)
+    cuda_capture_stream.synchronize()
+    capture = BreakableCUDAGraphCapture()
+    with capture:
+        query = x * 2
+        attention(query, output)
+        output.add_(3)
+
+    for value, bias in ((4, 7), (6, 11)):
+        x.fill_(value)
+        metadata["bias"] = bias
+        capture.replay()
+        torch.testing.assert_close(
+            output, torch.full_like(output, value * 2 + bias + 3)
+        )
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("full_capture", [False, True])
+def test_decorator_respects_capture_mode(
+    monkeypatch, cuda_capture_stream, enabled, full_capture
+):
+    """Only enabled non-FULL capture should replay Python side effects."""
+    from vllm.compilation.breakable_cudagraph import (
+        BreakableCUDAGraphCapture,
+        eager_break_during_capture,
+    )
+    from vllm.config import CUDAGraphMode
+    from vllm.forward_context import ForwardContext, override_forward_context
+
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", str(int(enabled)))
+    calls: list[None] = []
+
+    @eager_break_during_capture
+    def op(x, output):
+        calls.append(None)
+        torch.add(x, 1, out=output)
+
+    x = torch.ones(8, device="cuda")
+    output = torch.empty_like(x)
+    op(x, output)
+    calls.clear()
+    cuda_capture_stream.synchronize()
+    mode = CUDAGraphMode.FULL if full_capture else CUDAGraphMode.PIECEWISE
+    context = ForwardContext(
+        no_compile_layers={},
+        attn_metadata=None,
+        slot_mapping={},
+        cudagraph_runtime_mode=mode,
+    )
+    capture = BreakableCUDAGraphCapture()
+    with override_forward_context(context), capture:
+        op(x, output)
+    with override_forward_context(context):
+        x.fill_(4)
+        capture.replay()
+    torch.testing.assert_close(output, torch.full_like(output, 5))
+    assert len(calls) == (2 if enabled and not full_capture else 1)
 
 
 # ---------------------------------------------------------------------------

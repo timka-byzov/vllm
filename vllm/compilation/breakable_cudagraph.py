@@ -94,13 +94,15 @@ def eager_break_during_capture(fn: F) -> F:
         def unified_attention_with_output(...):
             ...
     """
-    if not is_breakable_cudagraph_enabled():
-        return fn
 
+    # Configuration can enable breakable graphs after model ops are imported.
+    # Install the wrapper unconditionally, but honor the flag at capture time.
     @functools.wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         capture = BreakableCUDAGraphCapture.current()
         if capture is None:
+            return fn(*args, **kwargs)
+        if not is_breakable_cudagraph_enabled():
             return fn(*args, **kwargs)
         if not capture._capturing:
             return fn(*args, **kwargs)
